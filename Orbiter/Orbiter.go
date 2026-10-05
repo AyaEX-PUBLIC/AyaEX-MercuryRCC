@@ -9,6 +9,8 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httputil"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -34,7 +36,14 @@ const (
 const (
 	engineStudio = "studio" // 2013 Studio hosted gameservers
 	engineRCC    = "rcc"    // gameservers hosted via RCCService jobs through the Proxy
+	engineAya    = "aya"    // native Aya.Server jobs through the Proxy, joined over WebSockets
 )
+
+// ayaEngine reports whether RCC hosting requests should go to Aya.Server, whose
+// browser Players connect over WebSockets (proxied by /play/{id}) instead of UDP
+func ayaEngine() bool {
+	return os.Getenv("RCC_IS_AYA") == "1"
+}
 
 // We don't need the launcher from setup, we're just running Studio
 // (arguably we don't need the Client either, but there's gonna be so many more clients than servers it's probably worth it)
@@ -637,6 +646,110 @@ func NewRCCGameserver(version string, id int) (*Gameserver, error) {
 	}, nil
 }
 
+// composeAyaHostScript takes the Site's serve loadscript as is (it is written
+// for Aya.Server), filling in the route the hosted script reports its status to
+func composeAyaHostScript(id int) (string, error) {
+	siteURL := os.Getenv("SITE_URL")
+	if siteURL == "" {
+		siteURL = fmt.Sprintf("http://www.%s", os.Getenv("DOMAIN"))
+	}
+	serveURL := fmt.Sprintf("%s/game/%d/serve", strings.TrimSuffix(siteURL, "/"), id)
+
+	res, err := http.Get(serveURL)
+	if err != nil {
+		return "", fmt.Errorf("fetch serve loadscript: %w", err)
+	}
+	serveScript, err := io.ReadAll(res.Body)
+	res.Body.Close()
+	if err != nil {
+		return "", fmt.Errorf("read serve loadscript: %w", err)
+	}
+	if res.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("fetch serve loadscript: unexpected status %s", res.Status)
+	}
+
+	script := string(serveScript)
+	// the signature line only matters to clients verifying loadscripts
+	if strings.HasPrefix(script, "--rbxsig%") {
+		if nl := strings.IndexByte(script, '\n'); nl != -1 {
+			script = script[nl+1:]
+		}
+	}
+
+	hostingURL := strings.TrimSuffix(os.Getenv("PROXY_URL"), "/")
+	script = strings.ReplaceAll(script, "_HOSTPING_URL", fmt.Sprintf("%s/hostping/%d", hostingURL, id))
+
+	Log(c.InBlue(fmt.Sprintf("[compose] %d - Aya host script ready (%d chars), port %d", id, len(script), idToPort(id))))
+	return script, nil
+}
+
+// NewAyaGameserver hosts a gameserver as a job on an Aya.Server instance via the
+// RCC proxy. There is no UDP relay: Players reach it through /play/{id}
+func NewAyaGameserver(_ string, id int) (*Gameserver, error) {
+	script, err := composeAyaHostScript(id)
+	if err != nil {
+		return nil, err
+	}
+
+	Log(c.InBlue(fmt.Sprintf("Sending Aya host job %d to RCC proxy", id)))
+
+	stopFn, err := submitHostJob(id, script)
+	if err != nil {
+		return nil, err
+	}
+
+	return &Gameserver{
+		GameserverInfo: GameserverInfo{
+			Pid:           os.Getpid(),
+			StartTime:     time.Now().UnixMilli(),
+			Status:        Starting,
+			statusChanged: make(chan struct{}, 100),
+		},
+		engine: engineAya,
+		stopFn: stopFn,
+		done:   make(chan struct{}),
+	}, nil
+}
+
+// submitHostJob sends a host script to the RCC proxy and returns a function
+// that closes the job again
+func submitHostJob(id int, script string) (func() error, error) {
+	proxyURL := strings.TrimSuffix(os.Getenv("PROXY_URL"), "/")
+	req, err := http.NewRequest("POST", fmt.Sprintf("%s/host/%d", proxyURL, id), strings.NewReader(script))
+	if err != nil {
+		return nil, fmt.Errorf("create request to RCC proxy: %w", err)
+	}
+	req.Header.Set("Content-Type", "text/plain")
+	req.Header.Set("Authorization", "Bearer "+os.Getenv("PROXY_KEY"))
+
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("send request to RCC proxy: %w", err)
+	}
+	io.Copy(io.Discard, res.Body)
+	res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("send request to RCC proxy: unexpected status %s", res.Status)
+	}
+
+	return func() error {
+		req, err := http.NewRequest("DELETE", fmt.Sprintf("%s/host/%d", proxyURL, id), nil)
+		if err != nil {
+			return err
+		}
+		req.Header.Set("Authorization", "Bearer "+os.Getenv("PROXY_KEY"))
+		res, err := http.DefaultClient.Do(req)
+		if err != nil {
+			return err
+		}
+		res.Body.Close()
+		if res.StatusCode != http.StatusOK {
+			return fmt.Errorf("unexpected status %s", res.Status)
+		}
+		return nil
+	}, nil
+}
+
 func (g *Gameserver) Stop() error {
 	if g.Status == Closed {
 		return nil
@@ -722,7 +835,7 @@ func idToPort(id int) int {
 }
 
 func TrackNetwork(server *Gameserver, id int) {
-	if server.engine == engineRCC {
+	if server.engine == engineRCC || server.engine == engineAya {
 		TrackRCCJob(server, id)
 		return
 	}
@@ -925,9 +1038,21 @@ func (gs *Gameservers) startRoute(w http.ResponseWriter, r *http.Request) {
 		engine = os.Getenv("DEFAULT_ENGINE")
 	}
 
+	if engine == engineRCC && ayaEngine() {
+		engine = engineAya
+	}
+
+	// statuses deferred before now came from an earlier run of this place
+	gs.pendingMu.Lock()
+	delete(gs.pending, id)
+	gs.pendingMu.Unlock()
+
 	var NewFunc = NewGameserver
-	if engine == engineRCC {
+	switch engine {
+	case engineRCC:
 		NewFunc = NewRCCGameserver
+	case engineAya:
+		NewFunc = NewAyaGameserver
 	}
 
 	server, err := NewFunc(gs.version, id)
@@ -994,8 +1119,10 @@ func (gs *Gameservers) statusPushRoute(w http.ResponseWriter, r *http.Request) {
 	var server *Gameserver
 	start := time.Now()
 	for time.Since(start) < 2*time.Second {
-		server = gs.servers[id]
-		if server != nil {
+		// a closed entry is a previous run of this place: the server this push
+		// belongs to hasn't been registered yet, so don't apply it to the old one
+		if s := gs.servers[id]; s != nil && s.Status != Closed {
+			server = s
 			break
 		}
 		time.Sleep(250 * time.Millisecond)
@@ -1026,6 +1153,8 @@ func (gs *Gameservers) applyStatus(id int, server *Gameserver, data []string) {
 		if server.Status == Starting {
 			server.SetStatus(Running)
 		}
+	case "Heartbeat":
+		// liveness only, recorded above
 	case "Loaded":
 		Log(c.InGreen(fmt.Sprintf("[hoststatus] %d host script loaded", id)))
 	case "PlayerAdded":
@@ -1117,9 +1246,31 @@ func (gs *Gameservers) streamRoute(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// playRoute proxies a browser Player's WebSocket to the Aya.Server hosting the
+// place. Only running gameservers are reachable, so this can't be used to reach
+// arbitrary local ports
+func (gs *Gameservers) playRoute(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.Atoi(r.PathValue("id"))
+	if err != nil {
+		http.Error(w, "Invalid ID", http.StatusBadRequest)
+		return
+	}
+
+	server, exists := gs.servers[id]
+	if !exists || server.Status != Running || server.engine != engineAya {
+		http.Error(w, "Gameserver not running for this ID", http.StatusNotFound)
+		return
+	}
+
+	target := &url.URL{Scheme: "http", Host: fmt.Sprintf("127.0.0.1:%d", idToPort(id))}
+	Log(c.InBlue(fmt.Sprintf("[play] %d - proxying player connection to %s", id, target.Host)))
+	httputil.NewSingleHostReverseProxy(target).ServeHTTP(w, r)
+}
+
 func servePublicStatus(gameservers *Gameservers) {
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /{id}", gameservers.streamRoute) // public
+	mux.HandleFunc("GET /{id}", gameservers.streamRoute)    // public
+	mux.HandleFunc("GET /play/{id}", gameservers.playRoute) // public, WebSocket
 
 	if os.Getenv("ENV") != "dev" {
 		Log(c.InCyan("~ Public status server is up on port 443 ~"))
@@ -1141,9 +1292,15 @@ func main() {
 	Log(c.InYellow("Loading environment variables..."))
 	Fatal(env.Load(".env"), "Failed to load environment variables. Please place them in a .env file in the current directory.")
 
-	Log(c.InYellow("Checking for gameserver files..."))
-	ver, err := LoadFromSetup()
-	Fatal(err, c.InRed("Failed to load necessary gameserver files from Setup domain."))
+	ver := ""
+	if os.Getenv("SKIP_SETUP") == "1" {
+		Log(c.InYellow("Skipping Setup download (SKIP_SETUP=1)"))
+	} else {
+		Log(c.InYellow("Checking for gameserver files..."))
+		var err error
+		ver, err = LoadFromSetup()
+		Fatal(err, c.InRed("Failed to load necessary gameserver files from Setup domain."))
+	}
 
 	// if runtime.GOOS != "windows" {
 	// 	Log(c.InYellow("Starting display server..."))

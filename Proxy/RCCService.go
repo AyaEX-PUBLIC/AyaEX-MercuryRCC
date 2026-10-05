@@ -16,6 +16,7 @@ import (
 	_ "embed"
 	"encoding/base64"
 	"encoding/binary"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
@@ -36,7 +37,29 @@ import (
 	. "github.com/tp-link-extender/RCCService/Shared"
 )
 
-const exePath = "./RCCService/RCCService.exe"
+const defaultExePath = "./RCCService/RCCService.exe"
+
+// rccExe is the RCC executable to run: RCCService.exe (through Wine on
+// non-Windows hosts) by default, or a native Aya.Server set with RCC_EXE
+func rccExe() string {
+	if exe := os.Getenv("RCC_EXE"); exe != "" {
+		return exe
+	}
+	return defaultExePath
+}
+
+// nativeRCC reports whether the RCC executable is a native Aya.Server rather
+// than a Windows RCCService.exe
+func nativeRCC() bool {
+	return !strings.HasSuffix(strings.ToLower(rccExe()), ".exe")
+}
+
+// xmlEscape makes a script safe to embed in a SOAP template
+func xmlEscape(s string) string {
+	var b strings.Builder
+	xml.EscapeText(&b, []byte(s))
+	return b.String()
+}
 
 var client http.Client
 
@@ -90,6 +113,7 @@ func (i *rccInstance) countJobs() int {
 
 type pool struct {
 	maxJobs      int
+	maxHostJobs  int // per-instance limit for hosted gameservers
 	basePort     int
 	expiration   string // raw template value
 	renewSeconds int    // 0 = don't renew (job may have 9999999999 expiration)
@@ -112,9 +136,44 @@ type job struct {
 
 var jobPool *pool
 
+// runNative runs one Aya.Server process for an instance until it exits
+func (i *rccInstance) runNative() {
+	exe, err := filepath.Abs(rccExe())
+	if err != nil {
+		Log(c.InRed("Failed to resolve RCC_EXE: " + err.Error()))
+		return
+	}
+
+	extra := os.Getenv("RCC_ARGS")
+	if extra == "" {
+		extra = "--websocket --noconsole --insecure"
+	}
+	args := append([]string{"--port", strconv.Itoa(i.port)}, strings.Fields(extra)...)
+
+	cmd := exec.Command(exe, args...)
+	// content/, shaders/ and ClientSettings.json are resolved from the working directory
+	cmd.Dir = filepath.Dir(exe)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	// with --noconsole, Aya.Server reads commands from stdin; an open pipe that's
+	// never written to keeps that loop blocked instead of spinning on EOF
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		Log(c.InRed("Failed to create Aya.Server stdin pipe: " + err.Error()))
+		return
+	}
+	defer stdin.Close()
+
+	Log(c.InPurple(fmt.Sprintf("Starting %s instance: %s %s", i.kind, exe, strings.Join(args, " "))))
+	if err := cmd.Run(); err != nil {
+		fmt.Println(err)
+	}
+}
+
 // run makes sure an instance's process stays alive until the instance is told to die
 func (i *rccInstance) run() {
-	args := []string{exePath, "-Console", strconv.Itoa(i.port)}
+	args := []string{rccExe(), "-Console", strconv.Itoa(i.port)}
 	if runtime.GOOS != "windows" {
 		args = append([]string{"wine"}, args...)
 	}
@@ -129,7 +188,13 @@ func (i *rccInstance) run() {
 			}
 		}
 
+		if nativeRCC() {
+			spawnMode = "native"
+		}
+
 		switch spawnMode {
+		case "native":
+			i.runNative()
 		case "detached":
 			// fully detached launch + process-list polling (Windows)
 			if err := spawnDetached(i); err != nil {
@@ -242,11 +307,18 @@ func (p *pool) pickInstance(kind string) (instance *rccInstance, ok bool) {
 		if !ins.alive || ins.kind != kind {
 			continue
 		}
-		if n := ins.countJobs(); n < p.maxJobs && (instance == nil || n < instance.countJobs()) {
+		if n := ins.countJobs(); n < p.maxJobsFor(kind) && (instance == nil || n < instance.countJobs()) {
 			instance = ins
 		}
 	}
 	return instance, instance != nil
+}
+
+func (p *pool) maxJobsFor(kind string) int {
+	if kind == "host" && p.maxHostJobs > 0 {
+		return p.maxHostJobs
+	}
+	return p.maxJobs
 }
 
 func (p *pool) getJob(id string) *job {
@@ -264,6 +336,15 @@ func (p *pool) deleteJob(id string) {
 // waitForRCC polls the instance's SOAP port until it responds
 func waitForRCC(port int) error {
 	for start := time.Now(); time.Since(start) < 60*time.Second; time.Sleep(100 * time.Millisecond) {
+		if nativeRCC() {
+			// Aya.Server's gSOAP listener doesn't answer a bare GET, so accepting
+			// a connection is the readiness signal
+			if conn, err := net.DialTimeout("tcp", fmt.Sprintf("localhost:%d", port), time.Second); err == nil {
+				conn.Close()
+				return nil
+			}
+			continue
+		}
 		if res, err := http.Get(fmt.Sprintf("http://localhost:%d", port)); err == nil {
 			res.Body.Close()
 			return nil
@@ -552,7 +633,7 @@ func idRoute(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	currentTemplate := strings.ReplaceAll(renderTemplate, "_TASK_ID", id)
 	currentTemplate = strings.ReplaceAll(currentTemplate, "_EXPIRATION", "30")
-	currentTemplate = strings.ReplaceAll(currentTemplate, "_RENDER_SCRIPT", script)
+	currentTemplate = strings.ReplaceAll(currentTemplate, "_RENDER_SCRIPT", xmlEscape(script))
 
 	Log(c.InBlue("Sending request to render " + id))
 	if err := jobPool.Submit(id, "render", currentTemplate); err != nil {
@@ -738,7 +819,7 @@ func hostRoute(w http.ResponseWriter, r *http.Request) {
 
 	currentTemplate := strings.ReplaceAll(hostTemplate, "_TASK_ID", id)
 	currentTemplate = strings.ReplaceAll(currentTemplate, "_EXPIRATION", os.Getenv("HOST_EXPIRATION"))
-	currentTemplate = strings.ReplaceAll(currentTemplate, "_HOST_SCRIPT", script+"  ")
+	currentTemplate = strings.ReplaceAll(currentTemplate, "_HOST_SCRIPT", xmlEscape(script)+"  ")
 
 	if err := jobPool.Submit(id, "host", currentTemplate); err != nil {
 		Log(c.InRed("Failed to start host job: " + err.Error()))
@@ -810,6 +891,11 @@ func main() {
 	Fatal(err, "MAX_JOBS_PER_RCC must be an integer")
 	basePort, err := strconv.Atoi(os.Getenv("RCC_BASE_PORT"))
 	Fatal(err, "RCC_BASE_PORT must be an integer")
+	maxHostJobs := maxJobs
+	if v := os.Getenv("MAX_HOST_JOBS_PER_RCC"); v != "" {
+		maxHostJobs, err = strconv.Atoi(v)
+		Fatal(err, "MAX_HOST_JOBS_PER_RCC must be an integer")
+	}
 
 	// HOW EXPIRATION WORKS:
 	// - HOST_EXPIRATION=300 -> jobs last 300s; leases are renewed with RenewLease every
@@ -827,6 +913,7 @@ func main() {
 	// leave orphaned instances behind
 	jobPool = &pool{
 		maxJobs:      maxJobs,
+		maxHostJobs:  maxHostJobs,
 		basePort:     basePort,
 		expiration:   expiration,
 		renew:        renewSeconds > 0,
@@ -878,7 +965,7 @@ func main() {
 // process beyond the initial CreateProcess call. Liveness is polled instead of
 // waiting on process handles
 func spawnDetached(i *rccInstance) error {
-	absExe, err := filepath.Abs(exePath)
+	absExe, err := filepath.Abs(rccExe())
 	if err != nil {
 		return err
 	}

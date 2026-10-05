@@ -6,7 +6,7 @@
 	<soap:Body>
 		<ns1:RenewLease>
 			<ns1:jobID>_TASK_ID</ns1:jobID>
-			<ns1:renewSeconds>_RENEW_SECONDS</ns1:renewSeconds>
+			<ns1:expirationInSeconds>_RENEW_SECONDS</ns1:expirationInSeconds>
 		</ns1:RenewLease>
 	</soap:Body>
 </soap:Envelope>
