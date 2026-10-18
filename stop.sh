@@ -8,6 +8,11 @@ for name in Orbiter Proxy; do
 		rm -f "$pidfile"
 	fi
 done
+# gameservers running in containers (GAMESERVER_IMAGE in Proxy/.env)
+containers="$(docker ps --quiet --filter label=mercury.gameserver 2>/dev/null || true)"
+if [[ -n "$containers" ]]; then
+	docker stop --time 5 $containers >/dev/null && echo "stopped gameserver containers"
+fi
 # Aya.Server instances started by the proxy are run with --port <SOAP port> first
 if pkill -f 'Aya\.Server --port '; then
 	# Aya.Server can ignore SIGTERM once its render thread is up

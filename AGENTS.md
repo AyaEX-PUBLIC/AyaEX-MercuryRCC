@@ -30,6 +30,14 @@ check diffs for keys before committing. Logs (`logs/`) are ignored too.
 - `./run.sh` builds both services and starts them in the background (logs in
   `logs/`); `./stop.sh` stops them and every Aya.Server they started. Run them
   from the desktop session: renders need `DISPLAY`.
+- Hosted gameservers run in a hardened container (`Gameserver/Dockerfile`, on
+  Docker Hardened Images Debian 13) when `GAMESERVER_IMAGE` is set in
+  `Proxy/.env`; renders stay native. Each game gets a fresh container: a non-root
+  user (the one running the proxy), no capabilities, a read-only filesystem, memory/CPU/process
+  limits, and only Aya's build and resources (read-only) plus the DataStore
+  folder (`data/datastore`, git-ignored) mounted. It shares the host network.
+  `Gameserver/build.sh` builds the image (needs `docker login dhi.io` once);
+  rebuild it if a new Aya.Server links a new library.
 - Restarting disconnects every player. Check `curl localhost:64991/` for running
   gameservers first.
 - `go vet ./...` and `gofmt -l .` in `Orbiter/` and `Proxy/` before committing.

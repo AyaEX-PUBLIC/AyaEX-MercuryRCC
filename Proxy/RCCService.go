@@ -191,8 +191,13 @@ func (i *rccInstance) run() {
 		if nativeRCC() {
 			spawnMode = "native"
 		}
+		if containerised(i.kind) {
+			spawnMode = "container"
+		}
 
 		switch spawnMode {
+		case "container":
+			i.runContainer()
 		case "native":
 			i.runNative()
 		case "detached":
@@ -239,6 +244,9 @@ func (i *rccInstance) run() {
 		}
 
 		if !alive {
+			if containerised(i.kind) {
+				jobPool.forget(i)
+			}
 			return
 		}
 
@@ -548,6 +556,7 @@ func (p *pool) CloseJob(id string) {
 			instance.mu.Lock()
 			delete(instance.jobs, id)
 			instance.mu.Unlock()
+			p.retire(instance)
 		}
 
 		p.deleteJob(id)
@@ -886,6 +895,7 @@ end)`
 func main() {
 	Log(c.InYellow("Loading environment variables..."))
 	Fatal(env.Load(".env"), "Failed to load environment variables. Please place them in a .env file in the current directory.")
+	checkGameserverImage()
 
 	maxJobs, err := strconv.Atoi(os.Getenv("MAX_JOBS_PER_RCC"))
 	Fatal(err, "MAX_JOBS_PER_RCC must be an integer")
