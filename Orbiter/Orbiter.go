@@ -399,6 +399,8 @@ func NewGameserver(version string, id int) (*Gameserver, error) {
 		return nil, err
 	}
 
+	// Studio can't send the Orbiter's key, which the serve route now needs:
+	// this path would have to be given the script like the RCC ones are
 	args := []string{
 		exePath,
 		"-script",
@@ -513,6 +515,18 @@ var (
 	rePresenceURL = regexp.MustCompile(`[a-z]+://[^"'\s]+/game/serverpresence\?ticket=[^"'\s]+`)
 )
 
+// getServeScript fetches a place's host script from the Site. It carries the
+// place's server ticket, so the Site only gives it to the Orbiter, which sends
+// GAMESERVER_KEY (Site/.env and Orbiter/.env have the same one).
+func getServeScript(serveURL string) (*http.Response, error) {
+	req, err := http.NewRequest("GET", serveURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+os.Getenv("GAMESERVER_KEY"))
+	return http.DefaultClient.Do(req)
+}
+
 // composeHostScript builds an inline, RCC-safe host script. Most parameters are taken
 // from the Site's serve loadscript, since it already has the right domain, map and
 // authentication info embedded
@@ -523,7 +537,7 @@ func composeHostScript(id int) (string, error) {
 	}
 	serveURL := fmt.Sprintf("%s/game/%d/serve", siteURL, id)
 
-	res, err := http.Get(serveURL)
+	res, err := getServeScript(serveURL)
 	if err != nil {
 		return "", fmt.Errorf("fetch serve loadscript: %w", err)
 	}
@@ -655,7 +669,7 @@ func composeAyaHostScript(id int) (string, error) {
 	}
 	serveURL := fmt.Sprintf("%s/game/%d/serve", strings.TrimSuffix(siteURL, "/"), id)
 
-	res, err := http.Get(serveURL)
+	res, err := getServeScript(serveURL)
 	if err != nil {
 		return "", fmt.Errorf("fetch serve loadscript: %w", err)
 	}

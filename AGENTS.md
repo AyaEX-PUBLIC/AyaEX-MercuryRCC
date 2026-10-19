@@ -25,6 +25,10 @@ instead of RCCService.exe under Wine:
 and the Aya.Server `--httpAccessKey`. They're git-ignored; keep it that way, and
 check diffs for keys before committing. Logs (`logs/`) are ignored too.
 
+The Orbiter sends `GAMESERVER_KEY` as a bearer token when it fetches a place's
+host script from the Site (`/game/{id}/serve`, which carries the place's server
+ticket), so it must match the one in the Site's `Site/.env`.
+
 ## Working on it
 
 - `./run.sh` builds both services and starts them in the background (logs in
