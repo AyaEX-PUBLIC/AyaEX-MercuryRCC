@@ -377,12 +377,21 @@ func (p *pool) Submit(id string, kind string, soap string) error {
 	p.mu.Unlock()
 
 	cleanupJob := func() {
-		if j := p.getJob(id); j != nil && j.stopRenew != nil {
+		j := p.getJob(id)
+		if j != nil && j.stopRenew != nil {
 			select {
 			case <-j.stopRenew:
 			default:
 				close(j.stopRenew)
 			}
+		}
+		// a job that failed to start leaves its instance, so a gameserver
+		// container doesn't stay up holding a job that never ran
+		if j != nil && j.instance != nil {
+			j.instance.mu.Lock()
+			delete(j.instance.jobs, id)
+			j.instance.mu.Unlock()
+			p.retire(j.instance)
 		}
 		p.deleteJob(id)
 	}
