@@ -18,6 +18,9 @@ instead of RCCService.exe under Wine:
   (branch `main`; the local branch tracks it, so `git push` works). `upstream`
   is the original `tp-link-extender/RCCService`.
 - The companion repo `../MercuryCore` (the Site) follows the same rule.
+- The remote `public` is the public, downstream GitHub mirror
+  (`AyaEX-PUBLIC/AyaEX-MercuryRCC`). Update it only when asked, after a secret
+  scan of what's new; MercuryCore's `aya/README.md` (Public releases) says how.
 
 ## Never commit secrets
 
