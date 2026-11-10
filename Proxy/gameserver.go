@@ -24,7 +24,7 @@ func gameserverImage() string {
 
 // containerised reports whether instances of a kind run in a container
 func containerised(kind string) bool {
-	return kind == "host" && gameserverImage() != "" && nativeRCC()
+	return hosted(kind) && gameserverImage() != "" && nativeRCC()
 }
 
 func envOr(name, fallback string) string {

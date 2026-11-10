@@ -85,7 +85,7 @@ func Logr(txt string) {
 type rccInstance struct {
 	port int
 
-	// dedicated workload: "render" or "host"; instances never change kind
+	// dedicated workload: "render", "host" or "edit"; instances never change kind
 	kind string
 
 	mu      sync.Mutex
@@ -127,7 +127,7 @@ type pool struct {
 
 type job struct {
 	id       string
-	kind     string // "render" or "host"
+	kind     string // "render", "host" or "edit"
 	instance *rccInstance
 
 	stopRenew chan struct{}
@@ -323,10 +323,23 @@ func (p *pool) pickInstance(kind string) (instance *rccInstance, ok bool) {
 }
 
 func (p *pool) maxJobsFor(kind string) int {
+	// an edit server (Team Create) changes its process's network password
+	// (NetworkServer:ConfigureAsCloudEditServer), so it never shares one
+	if kind == "edit" {
+		return 1
+	}
 	if kind == "host" && p.maxHostJobs > 0 {
 		return p.maxHostJobs
 	}
 	return p.maxJobs
+}
+
+// hosted reports whether a kind is a long-running server that players or
+// editors connect to: a game ("host") or a Team Create edit server ("edit").
+// Instances only run jobs of their own kind (pickInstance), so the two never
+// share a process either.
+func hosted(kind string) bool {
+	return kind == "host" || kind == "edit"
 }
 
 func (p *pool) getJob(id string) *job {
@@ -458,7 +471,7 @@ func (p *pool) Submit(id string, kind string, soap string) error {
 	Log(c.InGreen(fmt.Sprintf("Job %s (%s) started on instance port %d", id, kind, instance.port)))
 
 	// hosting jobs get their leases renewed, render jobs expire by themselves (30s)
-	if kind == "host" && p.renew {
+	if hosted(kind) && p.renew {
 		go p.renewLoop(j)
 	}
 
@@ -759,6 +772,15 @@ func pingIdRoute(w http.ResponseWriter, r *http.Request) {
 // hostping callback comes from hosted gameservers, padded by the proxy's host epilogue.
 // Statuses are relayed to the Orbiter's hoststatus route
 func hostpingIdRoute(w http.ResponseWriter, r *http.Request) {
+	relayHostPing(w, r, "/")
+}
+
+// the same for Team Create edit servers, which the Orbiter tracks under /edit/{id}
+func editpingIdRoute(w http.ResponseWriter, r *http.Request) {
+	relayHostPing(w, r, "/edit/")
+}
+
+func relayHostPing(w http.ResponseWriter, r *http.Request, orbiterPath string) {
 	Log(c.InBlue("Received host ping callback"))
 	ips := r.RemoteAddr[:strings.LastIndex(r.RemoteAddr, ":")]
 	ips = strings.Trim(ips, "[]")
@@ -783,7 +805,7 @@ func hostpingIdRoute(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	req, err := http.NewRequest("POST", endpoint+"/"+id, bytes.NewReader(readBody))
+	req, err := http.NewRequest("POST", endpoint+orbiterPath+id, bytes.NewReader(readBody))
 	if err != nil {
 		Log(c.InRed("Failed to create request to send host status to orbiter: " + err.Error()))
 		w.WriteHeader(http.StatusInternalServerError)
@@ -811,7 +833,21 @@ func hostpingIdRoute(w http.ResponseWriter, r *http.Request) {
 // hostRoute starts a hosted gameserver job on an RCC instance, coming from the Orbiter.
 // The Orbiter sends the full host script (from the Site) as the request body
 func hostRoute(w http.ResponseWriter, r *http.Request) {
-	Log(c.InBlue("Received host request"))
+	startHosted(w, r, "host", r.PathValue("id"), "/hostping/")
+}
+
+// editRoute starts a place's Team Create edit server. Its job is named
+// edit-{id}, so the place's game can run at the same time.
+func editRoute(w http.ResponseWriter, r *http.Request) {
+	startHosted(w, r, "edit", editJob(r.PathValue("id")), "/editping/")
+}
+
+func editJob(placeID string) string {
+	return "edit-" + placeID
+}
+
+func startHosted(w http.ResponseWriter, r *http.Request, kind, id, pingPath string) {
+	Log(c.InBlue("Received " + kind + " request"))
 	if !checkAuth(r) {
 		Log(c.InRed("Request to host route is not authenticated!"))
 		w.WriteHeader(http.StatusForbidden)
@@ -825,11 +861,9 @@ func hostRoute(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	id := r.PathValue("id")
-
 	// prepend our own status reporting to the script: OpenJobEx jobs don't pump a
 	// scheduler (see above), so nothing after RunService:Run() would ever execute
-	epilogue := strings.ReplaceAll(hostEpilogue, "_PING_URL", "http://127.0.0.1:"+strconv.Itoa(proxyListenerPort)+"/hostping/"+id)
+	epilogue := strings.ReplaceAll(hostEpilogue, "_PING_URL", "http://127.0.0.1:"+strconv.Itoa(proxyListenerPort)+pingPath+r.PathValue("id"))
 	script := epilogue + "\n\n" + string(loadScript)
 
 	firstLine := strings.SplitN(string(loadScript), "\n", 2)[0]
@@ -839,9 +873,9 @@ func hostRoute(w http.ResponseWriter, r *http.Request) {
 	currentTemplate = strings.ReplaceAll(currentTemplate, "_EXPIRATION", os.Getenv("HOST_EXPIRATION"))
 	currentTemplate = strings.ReplaceAll(currentTemplate, "_HOST_SCRIPT", xmlEscape(script)+"  ")
 
-	if err := jobPool.Submit(id, "host", currentTemplate); err != nil {
-		Log(c.InRed("Failed to start host job: " + err.Error()))
-		http.Error(w, "Failed to start host job: "+err.Error(), http.StatusInternalServerError)
+	if err := jobPool.Submit(id, kind, currentTemplate); err != nil {
+		Log(c.InRed("Failed to start " + kind + " job: " + err.Error()))
+		http.Error(w, "Failed to start "+kind+" job: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 }
@@ -859,6 +893,22 @@ func closeHostRoute(w http.ResponseWriter, r *http.Request) {
 	jobPool.CloseJob(id)
 
 	Log(c.InYellow("Host job " + id + " closed"))
+}
+
+// closeEditRoute closes a place's Team Create edit server. The engine gives
+// its script's game.OnClose up to 30 seconds, which is when it saves.
+func closeEditRoute(w http.ResponseWriter, r *http.Request) {
+	Log(c.InBlue("Received edit close request"))
+	if !checkAuth(r) {
+		Log(c.InRed("Request to close route is not authenticated!"))
+		w.WriteHeader(http.StatusForbidden)
+		return
+	}
+
+	id := editJob(r.PathValue("id"))
+	jobPool.CloseJob(id)
+
+	Log(c.InYellow("Edit job " + id + " closed"))
 }
 
 func checkAuth(r *http.Request) bool {
@@ -969,6 +1019,9 @@ func main() {
 	http.HandleFunc("POST /host/{id}", hostRoute)
 	http.HandleFunc("POST /hostping/{id}", hostpingIdRoute)
 	http.HandleFunc("DELETE /host/{id}", closeHostRoute)
+	http.HandleFunc("POST /edit/{id}", editRoute)
+	http.HandleFunc("POST /editping/{id}", editpingIdRoute)
+	http.HandleFunc("DELETE /edit/{id}", closeEditRoute)
 
 	Log(c.InGreen(fmt.Sprintf("~ RCCService proxy is up on port %d ~", proxyListenerPort)))
 	Log(c.InGreen("Send a POST request to /{your task id} with the render script as the body to start a render"))

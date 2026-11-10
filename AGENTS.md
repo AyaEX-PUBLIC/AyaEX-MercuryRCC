@@ -9,6 +9,15 @@ instead of RCCService.exe under Wine:
 - `Proxy/`: runs Aya.Server processes and sends them RCC SOAP jobs: hosted games
   (OpenJobEx, RenewLease, CloseJob) and thumbnail renders (BatchJobEx) (:64990).
 
+Besides its game, a place can have a Team Create **edit server**, where its
+editors build it together from Studio. The Orbiter tracks those apart, under
+`/edit` (`GET /edit/` lists them; `PUT`, `GET`, `DELETE`, `POST /edit/{id}`;
+editors connect through `/play/edit/{id}`), fetches their script from the
+Site's `/game/{id}/editserve`, and gives each a free port (61000-63999). The
+Proxy runs them as jobs of kind `edit` (`/edit/{id}`, `/editping/{id}`), one
+per Aya.Server process and never in a game's: an edit server changes its
+process's network password.
+
 ## Always commit and push
 
 - **Commit and push every change to this repository as soon as it's done and

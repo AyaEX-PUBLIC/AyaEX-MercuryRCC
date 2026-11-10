@@ -372,7 +372,19 @@ type Gameserver struct {
 	stopFn func() error
 	done   chan struct{}
 
+	// the port the server listens on, when it isn't the one from its ID
+	// (idToPort): Team Create edit servers get a free one, see allocEditPort
+	port int
+
 	stopOnce sync.Once
+}
+
+// listenPort is the local port players (or editors) are proxied to
+func (g *Gameserver) listenPort(id int) int {
+	if g.port != 0 {
+		return g.port
+	}
+	return idToPort(id)
 }
 
 // startGameProxy is the per-game UDP relay shared by both hosting engines
@@ -660,14 +672,34 @@ func NewRCCGameserver(version string, id int) (*Gameserver, error) {
 	}, nil
 }
 
+// A place can have two servers at once: its game, and its Team Create edit
+// server (kindEdit), where the place's editors build it together. They are
+// tracked apart (two Gameservers sets), run as different job kinds on the
+// proxy, and listen on different ports.
+const (
+	kindGame = ""
+	kindEdit = "edit"
+)
+
 // composeAyaHostScript takes the Site's serve loadscript as is (it is written
 // for Aya.Server), filling in the route the hosted script reports its status to
 func composeAyaHostScript(id int) (string, error) {
+	return composeAyaScript(id, kindGame, idToPort(id))
+}
+
+// composeAyaScript does that for either kind. An edit server's script comes
+// from the Site's editserve route, reports to the proxy's editping route, and
+// gets the port the Orbiter picked for it.
+func composeAyaScript(id int, kind string, port int) (string, error) {
 	siteURL := os.Getenv("SITE_URL")
 	if siteURL == "" {
 		siteURL = fmt.Sprintf("http://www.%s", os.Getenv("DOMAIN"))
 	}
-	serveURL := fmt.Sprintf("%s/game/%d/serve", strings.TrimSuffix(siteURL, "/"), id)
+	serveRoute, pingRoute := "serve", "hostping"
+	if kind == kindEdit {
+		serveRoute, pingRoute = "editserve", "editping"
+	}
+	serveURL := fmt.Sprintf("%s/game/%d/%s", strings.TrimSuffix(siteURL, "/"), id, serveRoute)
 
 	res, err := getServeScript(serveURL)
 	if err != nil {
@@ -691,10 +723,20 @@ func composeAyaHostScript(id int) (string, error) {
 	}
 
 	hostingURL := strings.TrimSuffix(os.Getenv("PROXY_URL"), "/")
-	script = strings.ReplaceAll(script, "_HOSTPING_URL", fmt.Sprintf("%s/hostping/%d", hostingURL, id))
+	script = strings.ReplaceAll(script, "_HOSTPING_URL", fmt.Sprintf("%s/%s/%d", hostingURL, pingRoute, id))
+	if kind == kindEdit {
+		script = strings.ReplaceAll(script, "_SERVER_PORT", strconv.Itoa(port))
+	}
 
-	Log(c.InBlue(fmt.Sprintf("[compose] %d - Aya host script ready (%d chars), port %d", id, len(script), idToPort(id))))
+	Log(c.InBlue(fmt.Sprintf("[compose] %s%d - Aya host script ready (%d chars), port %d", logKind(kind), id, len(script), port)))
 	return script, nil
+}
+
+func logKind(kind string) string {
+	if kind == "" {
+		return ""
+	}
+	return kind + " "
 }
 
 // NewAyaGameserver hosts a gameserver as a job on an Aya.Server instance via the
@@ -725,11 +767,86 @@ func NewAyaGameserver(_ string, id int) (*Gameserver, error) {
 	}, nil
 }
 
+// Edit servers listen in this range. It is clear of the games' ports
+// (idToPort: 10000-34999), their UDP relays (up to 59999), Linux's ephemeral
+// ports (32768-60999) and the proxy's SOAP ports (64989 up).
+const (
+	editPortFirst = 61000
+	editPortLast  = 63999
+)
+
+// allocEditPort picks a port no running edit server has and that nothing is
+// listening on
+func (gs *Gameservers) allocEditPort() (int, error) {
+	used := make(map[int]bool)
+	for _, server := range gs.servers {
+		if server.Status != Closed {
+			used[server.port] = true
+		}
+	}
+	for port := editPortFirst; port <= editPortLast; port++ {
+		if used[port] {
+			continue
+		}
+		listener, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
+		if err != nil {
+			continue
+		}
+		listener.Close()
+		return port, nil
+	}
+	return 0, errors.New("no free port for an edit server")
+}
+
+// NewAyaEditServer starts a place's Team Create edit server as a job of its
+// own kind on the RCC proxy (never in a game's process). Editors reach it
+// through /play/edit/{id}
+func (gs *Gameservers) NewAyaEditServer(id int) (*Gameserver, error) {
+	port, err := gs.allocEditPort()
+	if err != nil {
+		return nil, err
+	}
+
+	script, err := composeAyaScript(id, kindEdit, port)
+	if err != nil {
+		return nil, err
+	}
+
+	Log(c.InBlue(fmt.Sprintf("Sending Aya edit job %d to RCC proxy", id)))
+
+	stopFn, err := submitJob(id, kindEdit, script)
+	if err != nil {
+		return nil, err
+	}
+
+	return &Gameserver{
+		GameserverInfo: GameserverInfo{
+			Pid:           os.Getpid(),
+			StartTime:     time.Now().UnixMilli(),
+			Status:        Starting,
+			statusChanged: make(chan struct{}, 100),
+		},
+		engine: engineAya,
+		stopFn: stopFn,
+		done:   make(chan struct{}),
+		port:   port,
+	}, nil
+}
+
 // submitHostJob sends a host script to the RCC proxy and returns a function
 // that closes the job again
 func submitHostJob(id int, script string) (func() error, error) {
+	return submitJob(id, kindGame, script)
+}
+
+// submitJob does that for either kind: the proxy's /host or /edit routes
+func submitJob(id int, kind string, script string) (func() error, error) {
+	route := "host"
+	if kind == kindEdit {
+		route = "edit"
+	}
 	proxyURL := strings.TrimSuffix(os.Getenv("PROXY_URL"), "/")
-	req, err := http.NewRequest("POST", fmt.Sprintf("%s/host/%d", proxyURL, id), strings.NewReader(script))
+	req, err := http.NewRequest("POST", fmt.Sprintf("%s/%s/%d", proxyURL, route, id), strings.NewReader(script))
 	if err != nil {
 		return nil, fmt.Errorf("create request to RCC proxy: %w", err)
 	}
@@ -747,7 +864,7 @@ func submitHostJob(id int, script string) (func() error, error) {
 	}
 
 	return func() error {
-		req, err := http.NewRequest("DELETE", fmt.Sprintf("%s/host/%d", proxyURL, id), nil)
+		req, err := http.NewRequest("DELETE", fmt.Sprintf("%s/%s/%d", proxyURL, route, id), nil)
 		if err != nil {
 			return err
 		}
@@ -792,6 +909,7 @@ func (g *Gameserver) Stop() error {
 
 type Gameservers struct {
 	version     string
+	kind        string // kindGame, or kindEdit for the set of edit servers
 	servers     map[int]*Gameserver
 	serverAdded chan int
 
@@ -910,7 +1028,7 @@ func TrackNetwork(server *Gameserver, id int) {
 // The port-based probe is deliberately not used, since RCC's RakNet bindings
 // aren't reliably checkable with test-bind sockets
 func TrackRCCJob(server *Gameserver, id int) {
-	port := idToPort(id)
+	port := server.listenPort(id)
 	Log(c.InBlue(fmt.Sprintf("[track] %d rcc job - (port %05d) waiting for ready signal...", id, port)))
 
 	// startup: wait for the hosted script's Ready push (or a clean stop)
@@ -954,7 +1072,12 @@ func TrackRCCJob(server *Gameserver, id int) {
 func (gs *Gameservers) Track(server *Gameserver, id int) {
 	gs.servers[id] = server
 	gs.flushStatuses(id, server)
-	gs.serverAdded <- id
+	// only status streams read this, and edit servers have none: never wait
+	// for a reader
+	select {
+	case gs.serverAdded <- id:
+	default:
+	}
 
 	Log(fmt.Sprintf("[track] %d - tracking started", id))
 
@@ -1022,6 +1145,21 @@ func (gs *Gameservers) statusRoute(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// The Site asks this before it sends an editor to an edit server. One that
+	// died (a crash, its container stopped) would otherwise count as running
+	// until its heartbeats have been missing for a while, and editors trying
+	// to rejoin would be sent to nothing: see for ourselves that it listens.
+	if gs.kind == kindEdit && server.Status == Running {
+		conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", server.listenPort(id)), 500*time.Millisecond)
+		if err != nil {
+			Log(c.InRed(fmt.Sprintf("[status] edit %d - nothing listens on its port (%s), closing it", id, err.Error())))
+			server.Stop()
+			http.Error(w, "Gameserver not running for this ID", http.StatusNotFound)
+			return
+		}
+		conn.Close()
+	}
+
 	if err := json.NewEncoder(w).Encode(&server.GameserverInfo); err != nil {
 		http.Error(w, "Failed to encode response: "+err.Error(), http.StatusInternalServerError)
 		return
@@ -1067,6 +1205,10 @@ func (gs *Gameservers) startRoute(w http.ResponseWriter, r *http.Request) {
 		NewFunc = NewRCCGameserver
 	case engineAya:
 		NewFunc = NewAyaGameserver
+	}
+	if gs.kind == kindEdit {
+		// edit servers are always native Aya.Server jobs
+		NewFunc = func(string, int) (*Gameserver, error) { return gs.NewAyaEditServer(id) }
 	}
 
 	server, err := NewFunc(gs.version, id)
@@ -1276,15 +1418,33 @@ func (gs *Gameservers) playRoute(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	target := &url.URL{Scheme: "http", Host: fmt.Sprintf("127.0.0.1:%d", idToPort(id))}
-	Log(c.InBlue(fmt.Sprintf("[play] %d - proxying player connection to %s", id, target.Host)))
-	httputil.NewSingleHostReverseProxy(target).ServeHTTP(w, r)
+	target := &url.URL{Scheme: "http", Host: fmt.Sprintf("127.0.0.1:%d", server.listenPort(id))}
+	Log(c.InBlue(fmt.Sprintf("[play] %s%d - proxying player connection to %s", logKind(gs.kind), id, target.Host)))
+	proxy := httputil.NewSingleHostReverseProxy(target)
+	if gs.kind == kindEdit {
+		// An edit server that is gone (crashed, or its container was stopped)
+		// would only be noticed when its heartbeats have been missing for a
+		// while, and until then nobody could rejoin: forget it as soon as its
+		// port refuses a connection, so the next join starts a new one.
+		proxy.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, err error) {
+			// only a refused connection says the server is gone; an editor
+			// who gave up mid-request doesn't
+			var dial *net.OpError
+			if errors.As(err, &dial) && dial.Op == "dial" {
+				Log(c.InRed(fmt.Sprintf("[play] edit %d - can't reach the edit server (%s), closing it", id, err.Error())))
+				server.Stop()
+			}
+			http.Error(w, "Edit server not running", http.StatusBadGateway)
+		}
+	}
+	proxy.ServeHTTP(w, r)
 }
 
-func servePublicStatus(gameservers *Gameservers) {
+func servePublicStatus(gameservers, editservers *Gameservers) {
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /{id}", gameservers.streamRoute)    // public
-	mux.HandleFunc("GET /play/{id}", gameservers.playRoute) // public, WebSocket
+	mux.HandleFunc("GET /{id}", gameservers.streamRoute)         // public
+	mux.HandleFunc("GET /play/{id}", gameservers.playRoute)      // public, WebSocket
+	mux.HandleFunc("GET /play/edit/{id}", editservers.playRoute) // public, WebSocket (Team Create)
 
 	if os.Getenv("ENV") != "dev" {
 		Log(c.InCyan("~ Public status server is up on port 443 ~"))
@@ -1333,7 +1493,16 @@ func main() {
 	http.HandleFunc("DELETE /{id}", gameservers.closeRoute) // idempotency!!
 	http.HandleFunc("POST /{id}", gameservers.statusPushRoute)
 
-	go servePublicStatus(gameservers)
+	// Team Create edit servers, one per place being edited, beside its game
+	editservers := NewGameservers(ver)
+	editservers.kind = kindEdit
+	http.HandleFunc("GET /edit/{$}", editservers.listRoute)
+	http.HandleFunc("GET /edit/{id}", editservers.statusRoute)
+	http.HandleFunc("PUT /edit/{id}", editservers.startRoute)
+	http.HandleFunc("DELETE /edit/{id}", editservers.closeRoute)
+	http.HandleFunc("POST /edit/{id}", editservers.statusPushRoute)
+
+	go servePublicStatus(gameservers, editservers)
 
 	Log(c.InGreen("~ Orbiter is up on port 64991 ~"))
 	if err := http.ListenAndServe(":64991", nil); err != nil {
